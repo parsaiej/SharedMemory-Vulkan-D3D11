@@ -1,10 +1,14 @@
 #include <climits>
 #include <cstdint>
+
 #include <dxgi.h>
 #include <d3d11.h>
 
+// In order to use the Win32 external memory extensions for D3D11 Interop.
+#define VK_USE_PLATFORM_WIN32_KHR
+
+#define VOLK_IMPLEMENTATION
 #include <volk.h>
-#include <vulkan/vulkan_core.h>
 
 #define VMA_IMPLEMENTATION
 #include <vk_mem_alloc.h>
@@ -28,7 +32,7 @@ using namespace Microsoft::WRL;
 const UINT kTestImageWidth  = 1920;
 const UINT kTestImageHeight = 1080;
 
-bool SelectVulkanPhysicalDevice(VkInstance vkInstance, IDXGIAdapter* pDXGIAdapter, VkPhysicalDevice& vkPhysicalDevice)
+bool SelectVulkanPhysicalDevice(VkInstance vkInstance, const std::vector<const char*> requiredExtensions, IDXGIAdapter* pDXGIAdapter, VkPhysicalDevice& vkPhysicalDevice)
 {    
     uint32_t deviceCount = 0u;
     vkEnumeratePhysicalDevices(vkInstance, &deviceCount, nullptr);
@@ -58,7 +62,41 @@ bool SelectVulkanPhysicalDevice(VkInstance vkInstance, IDXGIAdapter* pDXGIAdapte
         break;
     }
 
-    return vkPhysicalDevice != VK_NULL_HANDLE;
+    if (vkPhysicalDevice == VK_NULL_HANDLE)
+        return false;
+
+    spdlog::info(L"Found a matching Vulkan Physical Device for the selected DXGI device [{}]", selectedAdapterDesc.Description);
+
+    // Confirm that the selected physical device supports the required extensions.
+    uint32_t supportedDeviceExtensionCount; 
+    vkEnumerateDeviceExtensionProperties(vkPhysicalDevice, nullptr, &supportedDeviceExtensionCount, nullptr);
+
+    std::vector<VkExtensionProperties> supportedDeviceExtensions(supportedDeviceExtensionCount);
+    vkEnumerateDeviceExtensionProperties(vkPhysicalDevice, nullptr, &supportedDeviceExtensionCount, supportedDeviceExtensions.data());
+
+    auto CheckExtension = [&](const char* extensionName)
+    {
+        for (const auto& deviceExtension : supportedDeviceExtensions)
+        {
+            if (!strcmp(deviceExtension.extensionName, extensionName))
+                return true;
+        }
+
+        return false;
+    };
+
+    for (const auto& requiredExtension : requiredExtensions)
+    {
+        if (!CheckExtension(requiredExtension))
+        {
+            spdlog::error("The selected physical device does not support required Vulkan Extension: {}", requiredExtension);
+            return false;
+        }
+
+        spdlog::info("Found required Vulkan Extension: {}", requiredExtension);
+    }
+
+    return true;
 }
 
 bool GetVulkanGraphicsQueueIndexFromDevice(VkPhysicalDevice vkPhysicalDevice, uint32_t& graphicsQueueIndex)
@@ -85,7 +123,7 @@ bool GetVulkanGraphicsQueueIndexFromDevice(VkPhysicalDevice vkPhysicalDevice, ui
     return graphicsQueueIndex != UINT_MAX;
 }
 
-bool CreateVulkanLogicalDevice(VkPhysicalDevice vkPhysicalDevice, uint32_t vkGraphicsQueueIndex, VkDevice& vkLogicalDevice)
+bool CreateVulkanLogicalDevice(VkPhysicalDevice vkPhysicalDevice, const std::vector<const char*>& requiredExtensions, uint32_t vkGraphicsQueueIndex, VkDevice& vkLogicalDevice)
 {
     float graphicsQueuePriority = 1.0;
 
@@ -95,8 +133,10 @@ bool CreateVulkanLogicalDevice(VkPhysicalDevice vkPhysicalDevice, uint32_t vkGra
     vkGraphicsQueueCreateInfo.pQueuePriorities = &graphicsQueuePriority;
 
     VkDeviceCreateInfo vkLogicalDeviceCreateInfo = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
-    vkLogicalDeviceCreateInfo.pQueueCreateInfos    = &vkGraphicsQueueCreateInfo;
-    vkLogicalDeviceCreateInfo.queueCreateInfoCount = 1u;
+    vkLogicalDeviceCreateInfo.pQueueCreateInfos       = &vkGraphicsQueueCreateInfo;
+    vkLogicalDeviceCreateInfo.queueCreateInfoCount    = 1u;
+    vkLogicalDeviceCreateInfo.enabledExtensionCount   = (uint32_t)requiredExtensions.size();
+    vkLogicalDeviceCreateInfo.ppEnabledExtensionNames = requiredExtensions.data();
 
     return vkCreateDevice(vkPhysicalDevice, &vkLogicalDeviceCreateInfo, nullptr, &vkLogicalDevice) == VK_SUCCESS;
 }
@@ -215,8 +255,13 @@ int main()
 
     volkLoadInstanceOnly(vkInstance);
 
+    std::vector<const char*> requiredDeviceExtensions;
+    {
+        requiredDeviceExtensions.push_back(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME);
+    }
+
     VkPhysicalDevice vkPhysicalDevice;
-    if (!SelectVulkanPhysicalDevice(vkInstance, pAdapter.Get(), vkPhysicalDevice))
+    if (!SelectVulkanPhysicalDevice(vkInstance, requiredDeviceExtensions, pAdapter.Get(), vkPhysicalDevice))
     {
         spdlog::critical("Failed to select a Vulkan Physical Device.");
         return 1;
@@ -230,7 +275,7 @@ int main()
     }
 
     VkDevice vkLogicalDevice;
-    if (!CreateVulkanLogicalDevice(vkPhysicalDevice, vkGraphicsQueueIndex, vkLogicalDevice))
+    if (!CreateVulkanLogicalDevice(vkPhysicalDevice, requiredDeviceExtensions, vkGraphicsQueueIndex, vkLogicalDevice))
     {
         spdlog::critical("Failed to create the Vulkan Logical Device");
         return 1;
@@ -246,7 +291,7 @@ int main()
         
         VmaAllocatorCreateInfo vkMemoryAllocatorCreateInfo = {};
         vkMemoryAllocatorCreateInfo.flags            = VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
-        vkMemoryAllocatorCreateInfo.vulkanApiVersion = VK_API_VERSION_1_2;
+        vkMemoryAllocatorCreateInfo.vulkanApiVersion = VK_API_VERSION_1_3;
         vkMemoryAllocatorCreateInfo.physicalDevice   = vkPhysicalDevice;
         vkMemoryAllocatorCreateInfo.device           = vkLogicalDevice;
         vkMemoryAllocatorCreateInfo.instance         = vkInstance;
@@ -286,12 +331,38 @@ int main()
     ComPtr<IDXGIResource> pSharedResource;
     if (!SUCCEEDED(pImageDX->QueryInterface(IID_PPV_ARGS(pSharedResource.GetAddressOf()))))
     {
-        spdlog::critical("Failed.");
+        spdlog::critical("Failed to open a shared resource handle for the D3D11 Image Resource.");
         return 1;
     }
 
     HANDLE sharedHandle;
     pSharedResource->GetSharedHandle(&sharedHandle);
+
+    // Import the handle to Vulkan. 
+    // ------------------------------------------------
+
+    VkMemoryWin32HandlePropertiesKHR vkImportedHandleProperties = { VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR };
+    if (vkGetMemoryWin32HandlePropertiesKHR(vkLogicalDevice, VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT, sharedHandle, &vkImportedHandleProperties) != VK_SUCCESS)
+    {
+        spdlog::critical("Failed to query the D3D11 Image Resource native Windows handle for Vulkan import.");
+        return 1;
+    }
+
+    VkImportMemoryWin32HandleInfoKHR vkImportedHandleInfo = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR };
+    vkImportedHandleInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT;
+    vkImportedHandleInfo.handle     = sharedHandle;
+    vkImportedHandleInfo.name       = L"Imported-D3D11-Image";
+
+    VkMemoryAllocateInfo vkImportAllocateInfo = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    vkImportAllocateInfo.pNext           = &vkImportedHandleInfo;
+    vkImportAllocateInfo.memoryTypeIndex = vkImportedHandleProperties.memoryTypeBits;
+
+    VkDeviceMemory vkImportedImageResource;
+    if (vkAllocateMemory(vkLogicalDevice, &vkImportAllocateInfo, nullptr, &vkImportedImageResource) != VK_SUCCESS)
+    {
+        spdlog::critical("Failed to import the D3D11 Image resource to a Vulkan Memory Allocation.");
+        return 1;
+    }
 
     // Create CPU-Accessible Staging Image Resource.
     // ------------------------------------------------
@@ -338,7 +409,7 @@ int main()
     }
     
     // Write out the result to disk.
-    stbi_write_jpg("Output.jpg", 1920, 1080, 4, mappedStagingMemory.pData, 100);
+    stbi_write_jpg("Output.jpg", kTestImageWidth, kTestImageHeight, 4, mappedStagingMemory.pData, 100);
 
     // Release Vulkan Primitives.
     vmaDestroyAllocator(vkMemoryAllocator);

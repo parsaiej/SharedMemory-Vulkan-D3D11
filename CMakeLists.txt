@@ -48,7 +48,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 
 target_link_libraries(${PROJECT_NAME} 
     GPUOpen::VulkanMemoryAllocator
-    volk::volk
+    volk::volk_headers
     spdlog::spdlog_header_only 
     dxgi 
     d3d11
