@@ -16,31 +16,40 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
+add_compile_definitions(_SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING)
+
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Packages
 # ---------------------------------
 
-find_package(Vulkan REQUIRED)
-find_package(spdlog REQUIRED)
-find_package(Stb    REQUIRED)
+find_package(Vulkan                REQUIRED)
+find_package(VulkanMemoryAllocator REQUIRED)
+find_package(spdlog                REQUIRED)
+find_package(Stb                   REQUIRED)
+find_package(volk                  REQUIRED)
 
 # Executable
 # ---------------------------------
 
 add_executable(${PROJECT_NAME} Source/Main.cpp)
 
-# Define
-# ---------------------------------
-
-target_compile_definitions(${PROJECT_NAME} PRIVATE USE_RENDERDOC)
-
 # Include
 # ---------------------------------
 
-target_include_directories(${PROJECT_NAME} PRIVATE ${Stb_INCLUDE_DIR} ${Vulkan_INCLUDE_DIRS} External/RenderDoc)
+target_include_directories(${PROJECT_NAME} PRIVATE 
+    ${Stb_INCLUDE_DIR} 
+    ${Vulkan_INCLUDE_DIRS} 
+    External/RenderDoc
+)
 
 # Link
 # ---------------------------------
 
-target_link_libraries(${PROJECT_NAME} ${Vulkan_LIBRARIES} spdlog::spdlog_header_only dxgi d3d11)
+target_link_libraries(${PROJECT_NAME} 
+    GPUOpen::VulkanMemoryAllocator
+    volk::volk
+    spdlog::spdlog_header_only 
+    dxgi 
+    d3d11
+)

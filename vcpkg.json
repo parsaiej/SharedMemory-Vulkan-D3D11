@@ -2,6 +2,8 @@
     "dependencies": 
     [
         { "name": "spdlog", "features": [ "wchar" ] },
-        "stb"
+        "stb",
+        "volk",
+        "vulkan-memory-allocator"
     ]
 }
