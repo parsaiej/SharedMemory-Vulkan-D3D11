@@ -1,4 +1,3 @@
-## TLDR
 A concise C++ demonstration of image resource interoperability between D3D11 and Vulkan. 
 
 <img width="786" alt="image" src="https://github.com/user-attachments/assets/b25b7726-6f9f-42f8-900d-5fe853869770">
