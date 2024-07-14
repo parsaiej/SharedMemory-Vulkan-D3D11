@@ -9,26 +9,23 @@
 
 #include <spdlog/spdlog.h>
 
-// In order to use the Win32 external memory extensions for D3D11 Interop.
+// Compile Vulkan for usage of extension:
+// VK_NV_external_memory_win32
 #define VK_USE_PLATFORM_WIN32_KHR
 
 #define VOLK_IMPLEMENTATION
 #include <volk.h>
 
-#define VMA_IMPLEMENTATION
-#include <vk_mem_alloc.h>
-
+// This experiment just writes images to disk, no swapchain or OS window.
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb_image_write.h>
 
-#ifdef USE_RENDERDOC
-    #include <renderdoc_app.h>
-    RENDERDOC_API_1_1_2* pRenderDocAPI = NULL;
-#endif
+constexpr const char* kOutputFileName = "Output.jpg";
 
 #include <format>
 #include <wrl.h>
 #include <codecvt>
+#include <filesystem>
 
 using namespace Microsoft::WRL;
 
@@ -68,8 +65,6 @@ bool SelectVulkanPhysicalDevice(const VkInstance& vkInstance, const std::vector<
     if (vkPhysicalDevice == VK_NULL_HANDLE)
         return false;
 
-    spdlog::info(L"Found a matching Vulkan Physical Device for the selected DXGI device [{}]", selectedAdapterDesc.Description);
-
     // Confirm that the selected physical device supports the required extensions.
     uint32_t supportedDeviceExtensionCount; 
     vkEnumerateDeviceExtensionProperties(vkPhysicalDevice, nullptr, &supportedDeviceExtensionCount, nullptr);
@@ -90,13 +85,11 @@ bool SelectVulkanPhysicalDevice(const VkInstance& vkInstance, const std::vector<
 
     for (const auto& requiredExtension : requiredExtensions)
     {
-        if (!CheckExtension(requiredExtension))
-        {
-            spdlog::error("The selected physical device does not support required Vulkan Extension: {}", requiredExtension);
-            return false;
-        }
-
-        spdlog::info("Found required Vulkan Extension: {}", requiredExtension);
+        if (CheckExtension(requiredExtension))
+            continue;
+        
+        spdlog::error("The selected Vulkan physical device does not support required Vulkan Extension: {}", requiredExtension);
+        return false;
     }
 
     return true;
@@ -146,24 +139,8 @@ bool CreateVulkanLogicalDevice(const VkPhysicalDevice& vkPhysicalDevice, const s
 
 bool SelectDXGIAdapter(IDXGIAdapter1** ppSelectedAdapter)
 {
-#ifdef _DEBUG
-    ComPtr<IDXGIDebug1> pDXGIDebug;
-    if (!SUCCEEDED(DXGIGetDebugInterface1(0, IID_PPV_ARGS(&pDXGIDebug)))) 
-    {
-        spdlog::critical("Failed to enable DXGI Debug reporting.");
-        return false;
-    }
-    
-    pDXGIDebug->EnableLeakTrackingForThread();
-#endif
-
-    UINT factoryFlags = 0u;
-#if defined(_DEBUG)
-    factoryFlags |= DXGI_CREATE_FACTORY_DEBUG;
-#endif
-
     ComPtr<IDXGIFactory1> pFactory;
-    if (!SUCCEEDED(CreateDXGIFactory2(factoryFlags, IID_PPV_ARGS(&pFactory))))
+    if (!SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&pFactory))))
         return false;
 
     UINT selectedAdapterIndex = UINT_MAX;
@@ -176,8 +153,6 @@ bool SelectDXGIAdapter(IDXGIAdapter1** ppSelectedAdapter)
     {
         DXGI_ADAPTER_DESC adapterDesc;
         pAdapter->GetDesc(&adapterDesc);
-
-        spdlog::info(L"Found DXGI Adapter: {}", adapterDesc.Description);
 
         if (adapterDesc.DedicatedVideoMemory < dedicatedVideoMemory)
             continue;
@@ -195,14 +170,13 @@ bool SelectDXGIAdapter(IDXGIAdapter1** ppSelectedAdapter)
     DXGI_ADAPTER_DESC selectedAdapterDesc;
     (*ppSelectedAdapter)->GetDesc(&selectedAdapterDesc);
 
-    spdlog::info(std::format(L"Selected DXGI Adapter: {}", selectedAdapterDesc.Description));
+    spdlog::info(L"Selected DXGI Adapter: {}", selectedAdapterDesc.Description);
 
     return true;
 }
 
 bool BindD3D11ImageToVulkanImage(const VkDevice& vkLogicalDevice, ID3D11Texture2D* pImageDX, VkDeviceMemory& vkImageMemory, VkImage& vkImage)
 {
-    // Create the Vulkan Image primitive.
     VkExternalMemoryImageCreateInfo vkExternalMemoryImageCreateInfo = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO };
     vkExternalMemoryImageCreateInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT;
 
@@ -243,7 +217,7 @@ bool BindD3D11ImageToVulkanImage(const VkDevice& vkLogicalDevice, ID3D11Texture2
     VkImportMemoryWin32HandleInfoKHR vkImportedHandleInfo = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR };
     vkImportedHandleInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT;
     vkImportedHandleInfo.handle     = sharedHandle;
-    vkImportedHandleInfo.name       = L"Imported-D3D11-Image";
+    vkImportedHandleInfo.name       = L"Shared-D3D11-Image";
     vkImportedHandleInfo.pNext      = &vkDedicatedAllocateInfo;
 
     VkMemoryAllocateInfo vkImportAllocateInfo = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
@@ -261,22 +235,6 @@ bool BindD3D11ImageToVulkanImage(const VkDevice& vkLogicalDevice, ID3D11Texture2
 
 int main()
 {
-    spdlog::info("Initializing...");
-    
-#ifdef USE_RENDERDOC
-    if(HMODULE mod = GetModuleHandleA("renderdoc.dll"))
-    {
-        pRENDERDOC_GetAPI RENDERDOC_GetAPI = (pRENDERDOC_GetAPI)GetProcAddress(mod, "RENDERDOC_GetAPI");
-        if (RENDERDOC_GetAPI(eRENDERDOC_API_Version_1_1_2, (void **)&pRenderDocAPI) != 1)
-        {
-            spdlog::critical("Failed to load the RenderDoc API.");
-            return 1;
-        }
-
-        spdlog::info("Loaded the RenderDoc API.");
-    }
-#endif
-
     ComPtr<IDXGIAdapter1> pAdapter;
     if (!SelectDXGIAdapter(pAdapter.GetAddressOf()))
     {
@@ -287,7 +245,8 @@ int main()
     D3D_FEATURE_LEVEL desiredFeatureLevel = D3D_FEATURE_LEVEL_11_1;
 
     UINT deviceCreationFlags = 0u;
-#if defined(_DEBUG) && !defined(USE_RENDERDOC)
+    
+#if defined(_DEBUG)
     deviceCreationFlags |= D3D11_CREATE_DEVICE_DEBUG;
 #endif
 
@@ -300,11 +259,7 @@ int main()
         return 1;
     }
 
-    spdlog::info("Created D3D11 Device and Immediate Mode Context.");
-
-#ifdef USE_RENDERDOC
-    if (pRenderDocAPI) pRenderDocAPI->StartFrameCapture(pDeviceDX.Get(), nullptr);
-#endif
+    spdlog::info("Initialized D3D11.");
 
     // Initialize Vulkan
     // ------------------------------------------------
@@ -322,8 +277,15 @@ int main()
     vkApplicationInfo.engineVersion      = VK_MAKE_VERSION(0, 0, 0);
     vkApplicationInfo.apiVersion         = VK_API_VERSION_1_3;
 
+    std::vector<const char*> requiredInstanceExtensions;
+#ifdef _DEBUG
+    requiredInstanceExtensions.push_back("VK_LAYER_KHRONOS_validation");
+#endif
+
     VkInstanceCreateInfo vkInstanceCreateInfo = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
-    vkInstanceCreateInfo.pApplicationInfo = &vkApplicationInfo;
+    vkInstanceCreateInfo.pApplicationInfo     = &vkApplicationInfo;
+    vkInstanceCreateInfo.enabledLayerCount    = (uint32_t)requiredInstanceExtensions.size();
+    vkInstanceCreateInfo.ppEnabledLayerNames  = requiredInstanceExtensions.data();
 
     VkInstance vkInstance;
     if (vkCreateInstance(&vkInstanceCreateInfo, nullptr, &vkInstance) != VK_SUCCESS)
@@ -361,27 +323,8 @@ int main()
     }
 
     volkLoadDevice(vkLogicalDevice);
-
-    VmaAllocator vkMemoryAllocator;
-    {
-        VmaVulkanFunctions vkMemoryAllocatorFunctions = {};
-        vkMemoryAllocatorFunctions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
-        vkMemoryAllocatorFunctions.vkGetDeviceProcAddr   = vkGetDeviceProcAddr;
-        
-        VmaAllocatorCreateInfo vkMemoryAllocatorCreateInfo = {};
-        vkMemoryAllocatorCreateInfo.flags            = VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
-        vkMemoryAllocatorCreateInfo.vulkanApiVersion = VK_API_VERSION_1_3;
-        vkMemoryAllocatorCreateInfo.physicalDevice   = vkPhysicalDevice;
-        vkMemoryAllocatorCreateInfo.device           = vkLogicalDevice;
-        vkMemoryAllocatorCreateInfo.instance         = vkInstance;
-        vkMemoryAllocatorCreateInfo.pVulkanFunctions = &vkMemoryAllocatorFunctions;
-        
-        if (vmaCreateAllocator(&vkMemoryAllocatorCreateInfo, &vkMemoryAllocator) != VK_SUCCESS)
-        {
-            spdlog::critical("Failed to create the Vulkan Memory Allocator.");
-            return 1;
-        }
-    }
+    
+    spdlog::info("Initialized Vulkan.");
 
     // Create GPU-native Image Resource.
     // ------------------------------------------------
@@ -403,6 +346,8 @@ int main()
         spdlog::critical("Failed to create the D3D11 Image resource.");
         return 1;
     }
+
+    spdlog::info("Successfully created a D3D11 Image Resource with external memory support.");
     
     // Bind the D3D11 Image To Vulkan Image (backed by the same memory on GPU).
     // ------------------------------------------------
@@ -411,10 +356,13 @@ int main()
     VkDeviceMemory vkImageMemory;
     if (!BindD3D11ImageToVulkanImage(vkLogicalDevice, pImageDX.Get(), vkImageMemory, vkImage))
     {
-        spdlog::critical("Failed to bind the ID3D11 Image resource to a Vulkan Image");
+        spdlog::critical("Failed to bind the ID3D11 Image resource to a Vulkan Image.");
+        return 1;
     }
 
-    // Create CPU-Accessible Staging Image Resource.
+    spdlog::info("Successfully created a Vulkan Image backed by the D3D11 Image memory allocation.");
+
+    // Create CPU-Accessible Staging D3D11 Image Resource.
     // ------------------------------------------------
 
     D3D11_TEXTURE2D_DESC stagingImageDesc = imageDesc;
@@ -443,9 +391,6 @@ int main()
 
         FLOAT clearColor[4] = { 1.0, 0.0, 0.0, 1.0 };
         pImmediateContextDX->ClearRenderTargetView(pRenderTargetViewDX.Get(), clearColor);
-
-        // Transfer the cleared native image to staging memory.
-        pImmediateContextDX->CopyResource(pStagingImageDX.Get(), pImageDX.Get());
     }
 #else
     // Clear the Image Resource from Vulkan
@@ -485,6 +430,24 @@ int main()
         vkGraphicsCommandBeginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkBeginCommandBuffer(vkGraphicsCommandBuffer, &vkGraphicsCommandBeginInfo);
 
+        VkImageMemoryBarrier barrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+        barrier.oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout           = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image               = vkImage;
+        
+        barrier.subresourceRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.baseMipLevel   = 0;
+        barrier.subresourceRange.levelCount     = 1;
+        barrier.subresourceRange.baseArrayLayer = 0;
+        barrier.subresourceRange.layerCount     = 1;
+        
+        barrier.srcAccessMask = 0;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        
+        vkCmdPipelineBarrier(vkGraphicsCommandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+
         VkImageSubresourceRange vkImageClearRange;
         vkImageClearRange.layerCount     = 1u;
         vkImageClearRange.baseMipLevel   = 0u;
@@ -492,7 +455,7 @@ int main()
         vkImageClearRange.levelCount     = 1u;
         vkImageClearRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
 
-        VkClearColorValue clearColor = { {0.0f, 0.0f, 1.0f, 1.0f} };
+        VkClearColorValue clearColor = { {0.25f, 0.5f, 1.0f, 1.0f} };
         vkCmdClearColorImage(vkGraphicsCommandBuffer, vkImage, VK_IMAGE_LAYOUT_GENERAL, &clearColor, 1u, &vkImageClearRange);
 
         vkEndCommandBuffer(vkGraphicsCommandBuffer);
@@ -508,21 +471,24 @@ int main()
             spdlog::critical("Failed to submit commands to the Vulkan Graphics Queue.");
             return 1;
         }
-
-        // Pause the thread until queue has finished all work.
+        
+        // Pause execution until the graphics queue has finished work.
         vkDeviceWaitIdle(vkLogicalDevice);
+
+        spdlog::info("Successfully cleared the Vulkan Image with color: [{},{},{},{}]", 
+            clearColor.float32[0], 
+            clearColor.float32[1], 
+            clearColor.float32[2], 
+            clearColor.float32[3]
+        );
 
         // Destroy command primitives.
         vkDestroyCommandPool(vkLogicalDevice, vkGraphicsCommandPool, nullptr);
-        
-        // Transfer the cleared native image to staging memory.
-        pImmediateContextDX->CopyResource(pStagingImageDX.Get(), pImageDX.Get());
     }
 #endif
-
-#ifdef USE_RENDERDOC
-    if (pRenderDocAPI) pRenderDocAPI->EndFrameCapture(pDeviceDX.Get(), nullptr);
-#endif
+    
+    // Transfer the cleared native image to staging memory.
+    pImmediateContextDX->CopyResource(pStagingImageDX.Get(), pImageDX.Get());
 
     // Map to CPU for copy.
     D3D11_MAPPED_SUBRESOURCE mappedStagingMemory;
@@ -531,16 +497,23 @@ int main()
         spdlog::critical("Failed to map a pointer to the staging image memory.");
         return 1;
     }
+
+    spdlog::info("Successfully copied the D3D11 Image to staging mapped memory.");
     
     // Write out the result to disk.
-    stbi_write_jpg("Output.jpg", kTestImageWidth, kTestImageHeight, 4, mappedStagingMemory.pData, 100);
+    stbi_write_jpg(kOutputFileName, kTestImageWidth, kTestImageHeight, 4, mappedStagingMemory.pData, 100);
+
+    char workingDirectory[MAX_PATH];
+    GetModuleFileNameA(NULL, workingDirectory, MAX_PATH);
+    std::filesystem::path workingDirectoryPath(workingDirectory);
+
+    spdlog::info("Successfully wrote image result to: {}\\{}", workingDirectoryPath.parent_path().string(), kOutputFileName);
 
     // Release Vulkan Primitives.
-    vkDestroyImage(vkLogicalDevice, vkImage, nullptr);
-    vkFreeMemory(vkLogicalDevice, vkImageMemory, nullptr);
-    vmaDestroyAllocator(vkMemoryAllocator);
-    vkDestroyDevice(vkLogicalDevice, nullptr);
-    vkDestroyInstance(vkInstance, nullptr);
+    vkDestroyImage    (vkLogicalDevice, vkImage,       nullptr);
+    vkFreeMemory      (vkLogicalDevice, vkImageMemory, nullptr);
+    vkDestroyDevice   (vkLogicalDevice,                nullptr);
+    vkDestroyInstance (vkInstance,                     nullptr);
 
     return 0;
 }

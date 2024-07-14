@@ -23,11 +23,10 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Packages
 # ---------------------------------
 
-find_package(Vulkan                REQUIRED)
-find_package(VulkanMemoryAllocator REQUIRED)
-find_package(spdlog                REQUIRED)
-find_package(Stb                   REQUIRED)
-find_package(volk                  REQUIRED)
+find_package(Vulkan REQUIRED)
+find_package(spdlog REQUIRED)
+find_package(Stb    REQUIRED)
+find_package(volk   REQUIRED)
 
 # Executable
 # ---------------------------------
@@ -37,17 +36,12 @@ add_executable(${PROJECT_NAME} Source/Main.cpp)
 # Include
 # ---------------------------------
 
-target_include_directories(${PROJECT_NAME} PRIVATE 
-    ${Stb_INCLUDE_DIR} 
-    ${Vulkan_INCLUDE_DIRS} 
-    External/RenderDoc
-)
+target_include_directories(${PROJECT_NAME} PRIVATE ${Stb_INCLUDE_DIR})
 
 # Link
 # ---------------------------------
 
 target_link_libraries(${PROJECT_NAME} 
-    GPUOpen::VulkanMemoryAllocator
     volk::volk_headers
     spdlog::spdlog_header_only 
     dxgi 

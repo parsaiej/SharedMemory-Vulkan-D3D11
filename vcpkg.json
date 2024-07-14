@@ -3,7 +3,6 @@
     [
         { "name": "spdlog", "features": [ "wchar" ] },
         "stb",
-        "volk",
-        "vulkan-memory-allocator"
+        "volk"
     ]
 }
