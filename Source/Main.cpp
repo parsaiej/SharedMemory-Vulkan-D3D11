@@ -2,7 +2,12 @@
 #include <cstdint>
 
 #include <dxgi.h>
+#include <dxgidebug.h>
+#include <dxgi1_6.h>
+
 #include <d3d11.h>
+
+#include <spdlog/spdlog.h>
 
 // In order to use the Win32 external memory extensions for D3D11 Interop.
 #define VK_USE_PLATFORM_WIN32_KHR
@@ -12,8 +17,6 @@
 
 #define VMA_IMPLEMENTATION
 #include <vk_mem_alloc.h>
-
-#include <spdlog/spdlog.h>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb_image_write.h>
@@ -32,7 +35,7 @@ using namespace Microsoft::WRL;
 const UINT kTestImageWidth  = 1920;
 const UINT kTestImageHeight = 1080;
 
-bool SelectVulkanPhysicalDevice(VkInstance vkInstance, const std::vector<const char*> requiredExtensions, IDXGIAdapter* pDXGIAdapter, VkPhysicalDevice& vkPhysicalDevice)
+bool SelectVulkanPhysicalDevice(const VkInstance& vkInstance, const std::vector<const char*> requiredExtensions, IDXGIAdapter* pDXGIAdapter, VkPhysicalDevice& vkPhysicalDevice)
 {    
     uint32_t deviceCount = 0u;
     vkEnumeratePhysicalDevices(vkInstance, &deviceCount, nullptr);
@@ -99,7 +102,7 @@ bool SelectVulkanPhysicalDevice(VkInstance vkInstance, const std::vector<const c
     return true;
 }
 
-bool GetVulkanGraphicsQueueIndexFromDevice(VkPhysicalDevice vkPhysicalDevice, uint32_t& graphicsQueueIndex)
+bool GetVulkanGraphicsQueueIndexFromDevice(const VkPhysicalDevice& vkPhysicalDevice, uint32_t& graphicsQueueIndex)
 {
     graphicsQueueIndex = UINT_MAX;
 
@@ -123,7 +126,7 @@ bool GetVulkanGraphicsQueueIndexFromDevice(VkPhysicalDevice vkPhysicalDevice, ui
     return graphicsQueueIndex != UINT_MAX;
 }
 
-bool CreateVulkanLogicalDevice(VkPhysicalDevice vkPhysicalDevice, const std::vector<const char*>& requiredExtensions, uint32_t vkGraphicsQueueIndex, VkDevice& vkLogicalDevice)
+bool CreateVulkanLogicalDevice(const VkPhysicalDevice& vkPhysicalDevice, const std::vector<const char*>& requiredExtensions, uint32_t vkGraphicsQueueIndex, VkDevice& vkLogicalDevice)
 {
     float graphicsQueuePriority = 1.0;
 
@@ -141,10 +144,26 @@ bool CreateVulkanLogicalDevice(VkPhysicalDevice vkPhysicalDevice, const std::vec
     return vkCreateDevice(vkPhysicalDevice, &vkLogicalDeviceCreateInfo, nullptr, &vkLogicalDevice) == VK_SUCCESS;
 }
 
-bool SelectDXGIAdapter(IDXGIAdapter** ppSelectedAdapter)
+bool SelectDXGIAdapter(IDXGIAdapter1** ppSelectedAdapter)
 {
-    ComPtr<IDXGIFactory> pFactory;
-    if (!SUCCEEDED(CreateDXGIFactory(IID_PPV_ARGS(&pFactory))))
+#ifdef _DEBUG
+    ComPtr<IDXGIDebug1> pDXGIDebug;
+    if (!SUCCEEDED(DXGIGetDebugInterface1(0, IID_PPV_ARGS(&pDXGIDebug)))) 
+    {
+        spdlog::critical("Failed to enable DXGI Debug reporting.");
+        return false;
+    }
+    
+    pDXGIDebug->EnableLeakTrackingForThread();
+#endif
+
+    UINT factoryFlags = 0u;
+#if defined(_DEBUG)
+    factoryFlags |= DXGI_CREATE_FACTORY_DEBUG;
+#endif
+
+    ComPtr<IDXGIFactory1> pFactory;
+    if (!SUCCEEDED(CreateDXGIFactory2(factoryFlags, IID_PPV_ARGS(&pFactory))))
         return false;
 
     UINT selectedAdapterIndex = UINT_MAX;
@@ -152,8 +171,8 @@ bool SelectDXGIAdapter(IDXGIAdapter** ppSelectedAdapter)
     // Select DXGI adapter based on the one that has the most dedicated video memory.
     SIZE_T dedicatedVideoMemory = 0u;
 
-    ComPtr<IDXGIAdapter> pAdapter;
-    for (UINT i = 0; pFactory->EnumAdapters(i, &pAdapter) != DXGI_ERROR_NOT_FOUND; ++i)
+    ComPtr<IDXGIAdapter1> pAdapter;
+    for (UINT i = 0; pFactory->EnumAdapters1(i, &pAdapter) != DXGI_ERROR_NOT_FOUND; ++i)
     {
         DXGI_ADAPTER_DESC adapterDesc;
         pAdapter->GetDesc(&adapterDesc);
@@ -170,13 +189,72 @@ bool SelectDXGIAdapter(IDXGIAdapter** ppSelectedAdapter)
         selectedAdapterIndex = i;
     }
 
-    if (pFactory->EnumAdapters(selectedAdapterIndex, ppSelectedAdapter) == DXGI_ERROR_NOT_FOUND)
+    if (pFactory->EnumAdapters1(selectedAdapterIndex, ppSelectedAdapter) == DXGI_ERROR_NOT_FOUND)
         return false;
 
     DXGI_ADAPTER_DESC selectedAdapterDesc;
     (*ppSelectedAdapter)->GetDesc(&selectedAdapterDesc);
 
     spdlog::info(std::format(L"Selected DXGI Adapter: {}", selectedAdapterDesc.Description));
+
+    return true;
+}
+
+bool BindD3D11ImageToVulkanImage(const VkDevice& vkLogicalDevice, ID3D11Texture2D* pImageDX, VkDeviceMemory& vkImageMemory, VkImage& vkImage)
+{
+    // Create the Vulkan Image primitive.
+    VkExternalMemoryImageCreateInfo vkExternalMemoryImageCreateInfo = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO };
+    vkExternalMemoryImageCreateInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT;
+
+    VkImageCreateInfo vkImageCreateInfo = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+    {
+        vkImageCreateInfo.pNext       = &vkExternalMemoryImageCreateInfo;
+        vkImageCreateInfo.format      = VK_FORMAT_R8G8B8A8_UNORM;
+        vkImageCreateInfo.imageType   = VK_IMAGE_TYPE_2D;
+        vkImageCreateInfo.arrayLayers = 1u;
+        vkImageCreateInfo.mipLevels   = 1u;
+        vkImageCreateInfo.extent      = { kTestImageWidth, kTestImageHeight, 1};
+        vkImageCreateInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        vkImageCreateInfo.samples     = VK_SAMPLE_COUNT_1_BIT;
+        vkImageCreateInfo.usage       = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    }
+
+    if (vkCreateImage(vkLogicalDevice, &vkImageCreateInfo, nullptr, &vkImage) != VK_SUCCESS)
+        return false;
+
+    // Open a shareable handle to D3D11 Image Resource.
+    ComPtr<IDXGIResource1> pSharedResource;
+    if (!SUCCEEDED(pImageDX->QueryInterface(IID_PPV_ARGS(pSharedResource.GetAddressOf()))))
+        return false;
+
+    HANDLE sharedHandle;
+    if (!SUCCEEDED(pSharedResource->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, L"Shared-D3D11-Image", &sharedHandle)))
+        return false;
+    
+    // Bind the Vulkan Memory Allocation to the exported D3D11 Image Resource Handle.
+    VkMemoryWin32HandlePropertiesKHR vkImportedHandleProperties = { VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR };
+    if (vkGetMemoryWin32HandlePropertiesKHR(vkLogicalDevice, VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT, sharedHandle, &vkImportedHandleProperties) != VK_SUCCESS)
+        return false;
+
+    // Specify that the provided Vulkan Image is the only one that can be used with the D3D11 Image memory. 
+    VkMemoryDedicatedAllocateInfo vkDedicatedAllocateInfo = { VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO };
+    vkDedicatedAllocateInfo.image = vkImage;
+
+    VkImportMemoryWin32HandleInfoKHR vkImportedHandleInfo = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR };
+    vkImportedHandleInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT;
+    vkImportedHandleInfo.handle     = sharedHandle;
+    vkImportedHandleInfo.name       = L"Imported-D3D11-Image";
+    vkImportedHandleInfo.pNext      = &vkDedicatedAllocateInfo;
+
+    VkMemoryAllocateInfo vkImportAllocateInfo = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    vkImportAllocateInfo.pNext           = &vkImportedHandleInfo;
+    vkImportAllocateInfo.memoryTypeIndex = VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT; 
+
+    if (vkAllocateMemory(vkLogicalDevice, &vkImportAllocateInfo, nullptr, &vkImageMemory) != VK_SUCCESS)
+        return false;
+
+    // Bind the Vulkan Image to the Memory.
+    vkBindImageMemory(vkLogicalDevice, vkImage, vkImageMemory, 0u);
 
     return true;
 }
@@ -199,14 +277,14 @@ int main()
     }
 #endif
 
-    ComPtr<IDXGIAdapter> pAdapter;
+    ComPtr<IDXGIAdapter1> pAdapter;
     if (!SelectDXGIAdapter(pAdapter.GetAddressOf()))
     {
         spdlog::critical("Failed to load a DXGI Adapter.");
         return 1;
     }
 
-    D3D_FEATURE_LEVEL selectedFeatureLevel;
+    D3D_FEATURE_LEVEL desiredFeatureLevel = D3D_FEATURE_LEVEL_11_1;
 
     UINT deviceCreationFlags = 0u;
 #if defined(_DEBUG) && !defined(USE_RENDERDOC)
@@ -215,7 +293,8 @@ int main()
 
     ComPtr<ID3D11Device>        pDeviceDX;
     ComPtr<ID3D11DeviceContext> pImmediateContextDX;
-    if (!SUCCEEDED(D3D11CreateDevice(pAdapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, deviceCreationFlags, nullptr, 0u, D3D11_SDK_VERSION, pDeviceDX.GetAddressOf(), &selectedFeatureLevel, pImmediateContextDX.GetAddressOf())))
+    D3D_FEATURE_LEVEL           selectedFeatureLevel;
+    if (!SUCCEEDED(D3D11CreateDevice (pAdapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, deviceCreationFlags, &desiredFeatureLevel, 1u, D3D11_SDK_VERSION, pDeviceDX.GetAddressOf(), &selectedFeatureLevel, pImmediateContextDX.GetAddressOf())))
     {
         spdlog::critical("Failed to create the D3D11 Device and Immediate Context.");
         return 1;
@@ -315,8 +394,8 @@ int main()
     imageDesc.Format    = DXGI_FORMAT_R8G8B8A8_UNORM;
     imageDesc.Usage     = D3D11_USAGE_DEFAULT;
     imageDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    imageDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
     imageDesc.SampleDesc.Count = 1;
-    imageDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
 
     ComPtr<ID3D11Texture2D> pImageDX;
     if (!SUCCEEDED(pDeviceDX->CreateTexture2D(&imageDesc, nullptr, pImageDX.GetAddressOf())))
@@ -324,44 +403,15 @@ int main()
         spdlog::critical("Failed to create the D3D11 Image resource.");
         return 1;
     }
-
-    // Open a shareable handle to D3D11 Image Resource.
+    
+    // Bind the D3D11 Image To Vulkan Image (backed by the same memory on GPU).
     // ------------------------------------------------
 
-    ComPtr<IDXGIResource> pSharedResource;
-    if (!SUCCEEDED(pImageDX->QueryInterface(IID_PPV_ARGS(pSharedResource.GetAddressOf()))))
+    VkImage        vkImage;
+    VkDeviceMemory vkImageMemory;
+    if (!BindD3D11ImageToVulkanImage(vkLogicalDevice, pImageDX.Get(), vkImageMemory, vkImage))
     {
-        spdlog::critical("Failed to open a shared resource handle for the D3D11 Image Resource.");
-        return 1;
-    }
-
-    HANDLE sharedHandle;
-    pSharedResource->GetSharedHandle(&sharedHandle);
-
-    // Import the handle to Vulkan. 
-    // ------------------------------------------------
-
-    VkMemoryWin32HandlePropertiesKHR vkImportedHandleProperties = { VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR };
-    if (vkGetMemoryWin32HandlePropertiesKHR(vkLogicalDevice, VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT, sharedHandle, &vkImportedHandleProperties) != VK_SUCCESS)
-    {
-        spdlog::critical("Failed to query the D3D11 Image Resource native Windows handle for Vulkan import.");
-        return 1;
-    }
-
-    VkImportMemoryWin32HandleInfoKHR vkImportedHandleInfo = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR };
-    vkImportedHandleInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT;
-    vkImportedHandleInfo.handle     = sharedHandle;
-    vkImportedHandleInfo.name       = L"Imported-D3D11-Image";
-
-    VkMemoryAllocateInfo vkImportAllocateInfo = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-    vkImportAllocateInfo.pNext           = &vkImportedHandleInfo;
-    vkImportAllocateInfo.memoryTypeIndex = vkImportedHandleProperties.memoryTypeBits;
-
-    VkDeviceMemory vkImportedImageResource;
-    if (vkAllocateMemory(vkLogicalDevice, &vkImportAllocateInfo, nullptr, &vkImportedImageResource) != VK_SUCCESS)
-    {
-        spdlog::critical("Failed to import the D3D11 Image resource to a Vulkan Memory Allocation.");
-        return 1;
+        spdlog::critical("Failed to bind the ID3D11 Image resource to a Vulkan Image");
     }
 
     // Create CPU-Accessible Staging Image Resource.
@@ -380,21 +430,95 @@ int main()
         return 1;
     }
 
-    // Create Render Target View.
+#if 0
+    // Clear the Image Resource from D3D11.
     // ------------------------------------------------
-
-    ComPtr<ID3D11RenderTargetView> pRenderTargetViewDX;
-    if (!SUCCEEDED(pDeviceDX->CreateRenderTargetView(pImageDX.Get(), nullptr, pRenderTargetViewDX.GetAddressOf())))
     {
-        spdlog::critical("Failed to create the D3D11 Render Target View for Image resource.");
-        return 1;
+        ComPtr<ID3D11RenderTargetView> pRenderTargetViewDX;
+        if (!SUCCEEDED(pDeviceDX->CreateRenderTargetView(pImageDX.Get(), nullptr, pRenderTargetViewDX.GetAddressOf())))
+        {
+            spdlog::critical("Failed to create the D3D11 Render Target View for Image resource.");
+            return 1;
+        }
+
+        FLOAT clearColor[4] = { 1.0, 0.0, 0.0, 1.0 };
+        pImmediateContextDX->ClearRenderTargetView(pRenderTargetViewDX.Get(), clearColor);
+
+        // Transfer the cleared native image to staging memory.
+        pImmediateContextDX->CopyResource(pStagingImageDX.Get(), pImageDX.Get());
     }
+#else
+    // Clear the Image Resource from Vulkan
+    // -----------------------------------------------
+    {
+        VkQueue vkGraphicsQueue;
+        vkGetDeviceQueue(vkLogicalDevice, vkGraphicsQueueIndex, 0u, &vkGraphicsQueue);
 
-    FLOAT clearColor[4] = { 1.0, 0.0, 0.0, 1.0 };
-    pImmediateContextDX->ClearRenderTargetView(pRenderTargetViewDX.Get(), clearColor);
+        VkCommandPoolCreateInfo vkGraphicsCommandPoolCreateInfo = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+        {
+            vkGraphicsCommandPoolCreateInfo.flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT | VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+            vkGraphicsCommandPoolCreateInfo.queueFamilyIndex = vkGraphicsQueueIndex;
+        }
 
-    // Transfer the cleared native image to staging memory.
-    pImmediateContextDX->CopyResource(pStagingImageDX.Get(), pImageDX.Get());
+        VkCommandPool vkGraphicsCommandPool;
+        if (vkCreateCommandPool(vkLogicalDevice, &vkGraphicsCommandPoolCreateInfo, nullptr, &vkGraphicsCommandPool) != VK_SUCCESS)
+        {
+            spdlog::critical("Failed to create a Vulkan Command Pool.");
+            return 1;
+        }
+
+        VkCommandBufferAllocateInfo vkGraphicsCommandAllocateInfo = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+        {
+            vkGraphicsCommandAllocateInfo.commandBufferCount = 1u;
+            vkGraphicsCommandAllocateInfo.commandPool        = vkGraphicsCommandPool;
+            vkGraphicsCommandAllocateInfo.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        }
+
+        VkCommandBuffer vkGraphicsCommandBuffer;
+        if (vkAllocateCommandBuffers(vkLogicalDevice, &vkGraphicsCommandAllocateInfo, &vkGraphicsCommandBuffer) != VK_SUCCESS)
+        {
+            spdlog::critical("Failed to create a Vulkan Command Buffer.");
+            return 1;
+        }
+
+        VkCommandBufferBeginInfo vkGraphicsCommandBeginInfo = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        vkGraphicsCommandBeginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(vkGraphicsCommandBuffer, &vkGraphicsCommandBeginInfo);
+
+        VkImageSubresourceRange vkImageClearRange;
+        vkImageClearRange.layerCount     = 1u;
+        vkImageClearRange.baseMipLevel   = 0u;
+        vkImageClearRange.baseArrayLayer = 0u;
+        vkImageClearRange.levelCount     = 1u;
+        vkImageClearRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+
+        VkClearColorValue clearColor = { {0.0f, 0.0f, 1.0f, 1.0f} };
+        vkCmdClearColorImage(vkGraphicsCommandBuffer, vkImage, VK_IMAGE_LAYOUT_GENERAL, &clearColor, 1u, &vkImageClearRange);
+
+        vkEndCommandBuffer(vkGraphicsCommandBuffer);
+
+        VkSubmitInfo vkGraphicsQueueSubmitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+        {
+            vkGraphicsQueueSubmitInfo.commandBufferCount = 1u;
+            vkGraphicsQueueSubmitInfo.pCommandBuffers    = &vkGraphicsCommandBuffer;
+        }
+
+        if (vkQueueSubmit(vkGraphicsQueue, 1u, &vkGraphicsQueueSubmitInfo, VK_NULL_HANDLE) != VK_SUCCESS)
+        {
+            spdlog::critical("Failed to submit commands to the Vulkan Graphics Queue.");
+            return 1;
+        }
+
+        // Pause the thread until queue has finished all work.
+        vkDeviceWaitIdle(vkLogicalDevice);
+
+        // Destroy command primitives.
+        vkDestroyCommandPool(vkLogicalDevice, vkGraphicsCommandPool, nullptr);
+        
+        // Transfer the cleared native image to staging memory.
+        pImmediateContextDX->CopyResource(pStagingImageDX.Get(), pImageDX.Get());
+    }
+#endif
 
 #ifdef USE_RENDERDOC
     if (pRenderDocAPI) pRenderDocAPI->EndFrameCapture(pDeviceDX.Get(), nullptr);
@@ -412,6 +536,8 @@ int main()
     stbi_write_jpg("Output.jpg", kTestImageWidth, kTestImageHeight, 4, mappedStagingMemory.pData, 100);
 
     // Release Vulkan Primitives.
+    vkDestroyImage(vkLogicalDevice, vkImage, nullptr);
+    vkFreeMemory(vkLogicalDevice, vkImageMemory, nullptr);
     vmaDestroyAllocator(vkMemoryAllocator);
     vkDestroyDevice(vkLogicalDevice, nullptr);
     vkDestroyInstance(vkInstance, nullptr);
